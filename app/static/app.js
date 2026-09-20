@@ -11,7 +11,10 @@
  * - 主持人：房间码连接（全量视野，含观察分享管理与回执门槛编排——卡片可依赖
  *   前置卡片，前置集齐目标组回执后才揭示，可设虚拟时钟超时秒数，超时标记为
  *   「超时揭示」；门槛状态仅主持人可见，随 gate_updated 事件与快照下发）；
+ *   另可逐卡锁定/重新开放处置答复，并实时看到各应答组的提交状态、正文与版本；
  * - 参与者：组加入码连接（服务端按组过滤快照与事件，不感知门槛编排）；
+ *   可在已揭示卡片下提交/修改本组处置答复（每组一份，携带 revision 乐观并发，
+ *   版本过期收到 409 与最新答复；锁定后只读），看不到他组答复正文；
  * - 观察者：限时观察链接（#/observe/{token}）进入，只读——只能看到已揭示的
  *   全员卡片与分享所选组卡片，拿不到房间码、组加入码、未揭示卡片与回执明细；
  *   链接到期或被撤销时服务端主动断开，重连也会被拒绝。
@@ -214,6 +217,11 @@ function sortedCards() {
 
 function renderCards() {
   const list = $('#card-list');
+  // 重渲染会重建列表：先记住正在编辑的答复框，渲染后恢复焦点与未提交文本
+  const active = document.activeElement;
+  const editingId = active && active.classList && active.classList.contains('answer-input')
+    ? active.dataset.cardId : null;
+  const editingVal = editingId ? active.value : '';
   list.innerHTML = '';
   const all = sortedCards();
   const visible = state.role === 'host' ? all : all.filter((c) => c.revealed);
@@ -250,6 +258,9 @@ function renderCards() {
     if (state.role === 'player' && card.revealed) {
       right.appendChild(receiptButton(card));
     }
+    if (state.role === 'host') {
+      right.appendChild(answerLockButton(card));
+    }
     if (state.role === 'host' && state.status !== 'running') {
       const del = document.createElement('button');
       del.className = 'card-del';
@@ -277,8 +288,21 @@ function renderCards() {
     if (state.role === 'host' && card.revealed) {
       const summary = receiptSummary(card);
       if (summary) li.appendChild(summary);
+      const answers = answerSummary(card);
+      if (answers) li.appendChild(answers);
+    }
+    if (state.role === 'player' && card.revealed) {
+      li.appendChild(answerEditor(card));
     }
     list.appendChild(li);
+  }
+  if (editingId) {
+    const ta = list.querySelector(`.answer-input[data-card-id="${editingId}"]`);
+    if (ta && !ta.disabled) {
+      ta.value = editingVal;
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    }
   }
 }
 
@@ -346,6 +370,140 @@ function receiptSummary(card) {
     box.appendChild(chip);
   }
   return box;
+}
+
+/* ---------------------------------------------------------- 处置答复 */
+
+/* 主持人：逐卡锁定/重新开放答复的开关（锁定后参与者只读，写入被 409 拒绝） */
+function answerLockButton(card) {
+  const btn = document.createElement('button');
+  btn.className = 'answer-lock-btn' + (card.answers_locked ? ' locked' : '');
+  btn.textContent = card.answers_locked ? '🔒 答复已锁定' : '🔓 答复开放';
+  btn.title = card.answers_locked
+    ? '点击重新开放：参与者可继续提交/修改本组答复'
+    : '点击锁定：参与者只读，提交/修改将被拒绝';
+  btn.onclick = () => api('POST',
+    `/api/rooms/${state.code}/cards/${card.id}/answers/${card.answers_locked ? 'unlock' : 'lock'}`)
+    .catch(showError);
+  return btn;
+}
+
+/* 主持人：已揭示卡片的各组答复状态、正文与版本（定向卡只看目标组，全员卡覆盖全部组） */
+function answerSummary(card) {
+  const a = card.answers;
+  if (!a || a.expected.length === 0) return null; // 房间内还没有参与组
+  const box = document.createElement('div');
+  box.className = 'answer-summary';
+
+  const head = document.createElement('div');
+  head.className = 'answer-summary-head';
+  const count = document.createElement('span');
+  const done = a.submitted.length === a.expected.length;
+  count.className = 'receipt-count' + (done ? ' done' : '');
+  count.textContent = `答复 ${a.submitted.length}/${a.expected.length}`;
+  head.appendChild(count);
+  for (const gid of a.expected) {
+    const got = a.submitted.find((s) => s.group_id === gid);
+    const chip = document.createElement('span');
+    chip.className = 'receipt-chip ' + (got ? 'receipt-ok' : 'receipt-wait');
+    chip.textContent = (got ? `✓ v${got.revision} ` : '未提交 · ') + groupName(gid);
+    head.appendChild(chip);
+  }
+  box.appendChild(head);
+
+  for (const s of a.submitted) {
+    const item = document.createElement('div');
+    item.className = 'answer-item';
+    const meta = document.createElement('div');
+    meta.className = 'answer-item-meta';
+    meta.textContent = `${groupName(s.group_id)} · 版本 ${s.revision}`;
+    item.appendChild(meta);
+    const body = document.createElement('div');
+    body.className = 'answer-item-body';
+    body.textContent = s.body || '（空）';
+    item.appendChild(body);
+    box.appendChild(item);
+  }
+  return box;
+}
+
+/* 参与者：已揭示卡片上的本组答复编辑器（每组一份；锁定后只读） */
+function answerEditor(card) {
+  const wrap = document.createElement('div');
+  wrap.className = 'answer-area';
+  const locked = card.answers_locked;
+  const ans = card.my_answer || null;
+
+  const head = document.createElement('div');
+  head.className = 'answer-head';
+  const label = document.createElement('span');
+  label.className = 'answer-label';
+  label.textContent = '处置答复（本组共享一份）';
+  head.appendChild(label);
+  const rev = document.createElement('span');
+  rev.className = 'answer-rev';
+  rev.textContent = locked ? '🔒 主持人已锁定，只读'
+    : ans ? `已提交 · 版本 ${ans.revision}` : '尚未提交';
+  head.appendChild(rev);
+  wrap.appendChild(head);
+
+  const ta = document.createElement('textarea');
+  ta.className = 'answer-input';
+  ta.dataset.cardId = card.id;
+  ta.rows = 3;
+  ta.maxLength = 4000;
+  ta.placeholder = locked ? '答复已被主持人锁定' : '输入本组的处置答复…';
+  ta.value = ans ? ans.body : '';
+  ta.disabled = locked;
+  wrap.appendChild(ta);
+
+  if (card._answerWarn) {
+    const warn = document.createElement('div');
+    warn.className = 'answer-warn';
+    warn.textContent = '同组其他窗口已提交新版本，继续保存将覆盖其内容';
+    wrap.appendChild(warn);
+  }
+
+  if (!locked) {
+    const save = document.createElement('button');
+    save.className = 'primary answer-save';
+    save.textContent = ans ? '更新答复' : '提交答复';
+    save.onclick = () => submitAnswer(card, ta, save);
+    wrap.appendChild(save);
+  }
+  return wrap;
+}
+
+/* 提交/修改本组答复：携带当前 revision 乐观并发；
+   版本过期（409）时载入服务端返回的最新答复，绝不静默覆盖同组内容 */
+async function submitAnswer(card, ta, btn) {
+  btn.disabled = true;
+  const cur = card.my_answer;
+  try {
+    const res = await api('PUT', `/api/join/${state.code}/cards/${card.id}/answer`, {
+      body: ta.value,
+      revision: cur ? cur.revision : 0,
+    });
+    card.my_answer = { body: res.body, revision: res.revision };
+    card._selfSavedRevision = res.revision; // 自己的提交回显不再提示冲突
+    card._answerWarn = false;
+    renderCards();
+  } catch (err) {
+    btn.disabled = false;
+    const d = err.detail;
+    if (err.status === 409 && d && d.error === 'revision_conflict') {
+      card.my_answer = d.answer ? { body: d.answer.body, revision: d.answer.revision } : null;
+      card._answerWarn = false;
+      showError(new Error('答复已被同组其他窗口更新，已为你载入最新版本'));
+      renderCards();
+    } else if (err.status === 409 && d && d.error === 'answers_locked') {
+      card.answers_locked = true;
+      showError(new Error('主持人已锁定该卡答复，当前为只读'));
+      renderCards();
+    } else {
+      showError(err);
+    }
+  }
 }
 
 /* ---------------------------------------------------------- 观察席分享 */
@@ -500,7 +658,7 @@ function applyEvent(msg) {
   switch (msg.type) {
     case 'card_added':
       if (!state.cards.some((c) => c.id === p.id)) {
-        initReceiptState(p); // 新卡必然零回执（未揭示不可回执）
+        initCardState(p); // 新卡必然零回执、零答复（未揭示不可回执）
         state.cards.push(p);
       }
       break;
@@ -510,7 +668,7 @@ function applyEvent(msg) {
     case 'card_revealed': {
       const card = state.cards.find((c) => c.id === p.id);
       if (card) Object.assign(card, p);
-      else { initReceiptState(p); state.cards.push(p); }
+      else { initCardState(p); state.cards.push(p); }
       break;
     }
     case 'receipt_updated': {
@@ -526,6 +684,31 @@ function applyEvent(msg) {
       }
       break;
     }
+    case 'answer_updated': {
+      // 含答复正文：主持人收全部，参与者只收本组（服务端已过滤）
+      const card = state.cards.find((c) => c.id === p.card_id);
+      if (!card) break;
+      if (state.role === 'host' && card.answers) {
+        const i = card.answers.submitted.findIndex((s) => s.group_id === p.group_id);
+        const entry = { group_id: p.group_id, body: p.body, revision: p.revision,
+                        updated_at: p.updated_at };
+        if (i >= 0) card.answers.submitted[i] = entry;
+        else card.answers.submitted.push(entry);
+      } else if (state.role === 'player' && p.group_id === state.groupId) {
+        card.my_answer = { body: p.body, revision: p.revision };
+        // 正在编辑时收到同组新版本：保留未提交文本并提示，而非直接覆盖
+        const active = document.activeElement;
+        const editing = active && active.classList && active.classList.contains('answer-input')
+          && active.dataset.cardId === String(card.id);
+        if (editing && p.revision !== card._selfSavedRevision) card._answerWarn = true;
+      }
+      break;
+    }
+    case 'answer_lock_updated': {
+      const card = state.cards.find((c) => c.id === p.card_id);
+      if (card) card.answers_locked = p.answers_locked;
+      break;
+    }
     case 'gate_updated': {
       // 仅主持人会收到：门槛状态由服务端权威计算，直接替换
       const card = state.cards.find((c) => c.id === p.card_id);
@@ -534,10 +717,15 @@ function applyEvent(msg) {
     }
     case 'group_added':
       if (!state.groups.some((g) => g.id === p.id)) state.groups.push(p);
-      // 新组自动成为所有全员卡片的待回执方
+      // 新组自动成为所有全员卡片的待回执方与待答复方
       state.cards.forEach((c) => {
-        if (c.group_id == null && c.receipts && !c.receipts.expected.includes(p.id)) {
-          c.receipts.expected.push(p.id);
+        if (c.group_id == null) {
+          if (c.receipts && !c.receipts.expected.includes(p.id)) {
+            c.receipts.expected.push(p.id);
+          }
+          if (c.answers && !c.answers.expected.includes(p.id)) {
+            c.answers.expected.push(p.id);
+          }
         }
       });
       break;
@@ -552,6 +740,10 @@ function applyEvent(msg) {
         if (c.receipts) {
           c.receipts.expected = c.receipts.expected.filter((id) => id !== p.id);
           c.receipts.acked = c.receipts.acked.filter((id) => id !== p.id);
+        }
+        if (c.answers) {
+          c.answers.expected = c.answers.expected.filter((id) => id !== p.id);
+          c.answers.submitted = c.answers.submitted.filter((s) => s.group_id !== p.id);
         }
       });
       break;
@@ -573,6 +765,10 @@ function applyEvent(msg) {
         c.revealed_at_ms = null;
         if (c.receipts) c.receipts.acked = []; // 回执随揭示一并收回
         if ('my_receipt' in c) c.my_receipt = false;
+        c.answers_locked = false;            // 答复锁定一并解除
+        if (c.answers) c.answers.submitted = [];
+        if ('my_answer' in c) c.my_answer = null;
+        c._answerWarn = false;
       });
       syncClock('idle', 0);
       break;
@@ -580,16 +776,21 @@ function applyEvent(msg) {
   renderAll();
 }
 
-/* 事件流里新增的卡片不带回执字段（新卡/新揭示必然零回执），按角色补默认值；
-   观察者只读，不附加任何回执状态 */
-function initReceiptState(card) {
+/* 事件流里新增的卡片不带回执/答复字段（新卡/新揭示必然零回执、零答复），按角色补默认值；
+   观察者只读，不附加任何回执与答复状态 */
+function initCardState(card) {
   if (state.role === 'host') {
     card.receipts = {
       expected: card.group_id == null ? state.groups.map((g) => g.id) : [card.group_id],
       acked: [],
     };
+    card.answers = {
+      expected: card.group_id == null ? state.groups.map((g) => g.id) : [card.group_id],
+      submitted: [],
+    };
   } else if (state.role === 'player') {
     card.my_receipt = false;
+    card.my_answer = null;
   }
 }
 
@@ -631,8 +832,13 @@ async function api(method, path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
-    const detail = await res.json().catch(() => ({}));
-    throw new Error(detail.detail || `请求失败 (${res.status})`);
+    const data = await res.json().catch(() => ({}));
+    const d = data.detail;
+    // 409 冲突等场景 detail 可能是结构化对象（如答复版本冲突携带最新答复）
+    const err = new Error(typeof d === 'string' ? d : (d && d.error) || `请求失败 (${res.status})`);
+    err.status = res.status;
+    if (d && typeof d === 'object') err.detail = d;
+    throw err;
   }
   return res.json();
 }

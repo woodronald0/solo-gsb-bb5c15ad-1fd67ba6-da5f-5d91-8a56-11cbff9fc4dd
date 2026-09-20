@@ -13,6 +13,12 @@
   生成可撤销的随机观察链接；观察者只读，仅能收到已揭示的全员卡片与
   所选组卡片，拿不到未揭示卡、房间码、组加入码、回执明细与控制能力；
   到期或撤销时立即断开在线观察者，凭证此后一律失效
+- 处置答复：参与者对本组可见且已揭示的卡片提交/修改一份组内答复，
+  更新必须携带当前 revision，版本过期返回 409 与最新答复（防同组多窗口
+  静默覆盖）；主持人可逐卡锁定/重新开放（锁定后参与者只读、写入 409），
+  并实时看到各应答组的提交状态、正文与版本（定向卡仅目标组，全员卡覆盖
+  现有全部组）；答复持久化，经快照与 WebSocket 恢复，参与者看不到他组
+  正文；重置演练时清空答复并解除锁定
 - WebSocket：先下发权威快照，再广播单调递增的增量事件
 - 分组定向：参与者凭组加入码连接，快照与后续事件都按该组过滤；
   未命中的卡片在触发前后都不通过 REST 或 WebSocket 下发，主持人始终可见全部
@@ -97,6 +103,18 @@ def card_public(card: sqlite3.Row) -> dict:
         "group_id": card["group_id"],  # None = 全员
         "revealed": bool(card["revealed"]),
         "revealed_at_ms": card["revealed_at_ms"],
+        "answers_locked": bool(card["answers_locked"]),  # 答复锁定状态（不含任何答复内容）
+    }
+
+
+def answer_public(answer: sqlite3.Row) -> dict:
+    """一份组内答复的序列化。含正文，只随主持人/本组视野下发，绝不给他组与观察者。"""
+    return {
+        "card_id": answer["card_id"],
+        "group_id": answer["group_id"],
+        "body": answer["body"],
+        "revision": answer["revision"],
+        "updated_at": answer["updated_at"],
     }
 
 
@@ -273,6 +291,8 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
 
     回执数据同样按视野下发：主持人拿到每张卡的 expected/acked 汇总，
     参与者只拿到本组是否已回执（my_receipt），观察者完全拿不到回执。
+    处置答复同理：主持人拿到每张卡的 expected/submitted（含各组正文与版本），
+    参与者只拿到本组答复（my_answer），观察者完全拿不到答复。
     """
     if isinstance(scope, ObserverScope):
         gids = sorted(scope.group_ids)
@@ -338,7 +358,7 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
 
 def snapshot_cards(room: sqlite3.Row, cards: list[sqlite3.Row],
                    groups: list[sqlite3.Row], scope: int | None) -> list[dict]:
-    """为快照中的卡片附加回执视图（按视野分别计算）。"""
+    """为快照中的卡片附加回执与答复视图（按视野分别计算）。"""
     if scope is None:
         # 主持人：每张卡 expected = 全员卡取全部参与组 / 定向卡取目标组；acked = 已回执组
         acked_map: dict[int, set[int]] = {}
@@ -346,6 +366,10 @@ def snapshot_cards(room: sqlite3.Row, cards: list[sqlite3.Row],
             "SELECT card_id, group_id FROM receipts WHERE room_id = ?", (room["id"],)
         ):
             acked_map.setdefault(row["card_id"], set()).add(row["group_id"])
+        # 处置答复：按卡片聚合各组已提交的正文与版本（与回执同一 expected 口径）
+        answers_map: dict[int, dict[int, sqlite3.Row]] = {}
+        for row in db.execute("SELECT * FROM answers WHERE room_id = ?", (room["id"],)):
+            answers_map.setdefault(row["card_id"], {})[row["group_id"]] = row
         group_ids = [g["id"] for g in groups]
         out = []
         for card in cards:
@@ -356,12 +380,18 @@ def snapshot_cards(room: sqlite3.Row, cards: list[sqlite3.Row],
                 "expected": expected,
                 "acked": [gid for gid in expected if gid in acked],
             }
+            submitted = answers_map.get(card["id"], {})
+            data["answers"] = {
+                "expected": expected,
+                "submitted": [answer_public(submitted[gid])
+                              for gid in expected if gid in submitted],
+            }
             gate = gate_view(card)  # 门槛状态仅主持人可见
             if gate is not None:
                 data["gate"] = gate
             out.append(data)
         return out
-    # 参与者：仅本组是否已回执
+    # 参与者：仅本组是否已回执、本组答复（看不到他组正文）
     mine = {
         row["card_id"]
         for row in db.execute(
@@ -369,10 +399,21 @@ def snapshot_cards(room: sqlite3.Row, cards: list[sqlite3.Row],
             (room["id"], scope),
         )
     }
+    my_answers = {
+        row["card_id"]: row
+        for row in db.execute(
+            "SELECT * FROM answers WHERE room_id = ? AND group_id = ?",
+            (room["id"], scope),
+        )
+    }
     out = []
     for card in cards:
         data = card_public(card)
         data["my_receipt"] = card["id"] in mine
+        ans = my_answers.get(card["id"])
+        data["my_answer"] = (
+            {"body": ans["body"], "revision": ans["revision"]} if ans is not None else None
+        )
         out.append(data)
     return out
 
@@ -387,19 +428,19 @@ def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) 
     if type_.startswith("share_") or type_ == "gate_updated":
         return False  # 分享凭证与门槛编排细节仅主持人可见
     if isinstance(scope, ObserverScope):
-        if type_ in ("card_revealed", "card_removed"):
+        if type_ in ("card_revealed", "card_removed", "answer_lock_updated"):
             gid = payload.get("group_id")
             return gid is None or gid in scope.group_ids
         if type_ in ("group_renamed", "group_removed"):
             return payload.get("id") in scope.group_ids
-        if type_ in ("card_added", "group_added", "receipt_updated"):
-            return False  # 未揭示卡、组加入码、回执明细一律不下发
+        if type_ in ("card_added", "group_added", "receipt_updated", "answer_updated"):
+            return False  # 未揭示卡、组加入码、回执明细、答复正文一律不下发
         return True  # clock / reset 等房间级事件
-    if type_ in ("card_added", "card_revealed", "card_removed"):
+    if type_ in ("card_added", "card_revealed", "card_removed", "answer_lock_updated"):
         gid = payload.get("group_id")
         return gid is None or gid == scope
-    if type_ == "receipt_updated":
-        return payload.get("group_id") == scope  # 参与者只感知本组的回执变化
+    if type_ in ("receipt_updated", "answer_updated"):
+        return payload.get("group_id") == scope  # 参与者只感知本组的回执/答复变化
     if type_ == "group_renamed":
         return payload.get("id") == scope  # 参与者只需感知本组改名
     if type_ in ("group_added", "group_removed"):
@@ -750,8 +791,8 @@ async def delete_card(code: str, card_id: int):
 
 # ---------------------------------------------------------------- REST：回执
 
-def resolve_receipt_target(join_code: str, card_id: int) -> tuple[sqlite3.Row, sqlite3.Row]:
-    """把参与者回执请求解析为 (参与组, 卡片)。
+def resolve_group_card(join_code: str, card_id: int) -> tuple[sqlite3.Row, sqlite3.Row]:
+    """把参与者请求（回执/答复）解析为 (参与组, 卡片)。
 
     参与者凭组加入码操作，且只能操作本组可见的卡片（全员卡或目标为本组的卡）；
     不可见的卡片一律 404，不向参与者暴露其存在。
@@ -775,7 +816,7 @@ def resolve_receipt_target(join_code: str, card_id: int) -> tuple[sqlite3.Row, s
 async def ack_card(join_code: str, card_id: int):
     """参与者标记「已收到」。幂等：同一参与组对同一卡片仅保留一条回执。"""
     async with state_lock:
-        group, card = resolve_receipt_target(join_code, card_id)
+        group, card = resolve_group_card(join_code, card_id)
         if not card["revealed"]:
             raise HTTPException(status_code=409, detail="card not revealed yet")
         existing = db.execute(
@@ -800,7 +841,7 @@ async def ack_card(join_code: str, card_id: int):
 async def unack_card(join_code: str, card_id: int):
     """参与者撤销回执。幂等：本就没有回执时直接返回当前状态。"""
     async with state_lock:
-        group, card = resolve_receipt_target(join_code, card_id)
+        group, card = resolve_group_card(join_code, card_id)
         cur = db.execute(
             "DELETE FROM receipts WHERE card_id = ? AND group_id = ?",
             (card_id, group["id"]),
@@ -812,6 +853,96 @@ async def unack_card(join_code: str, card_id: int):
                           {"card_id": card_id, "group_id": group["id"], "acked": False})
             await publish_gate_refresh(room, card_id)  # 依赖本卡的门槛可能回到等待
         return {"card_id": card_id, "group_id": group["id"], "acked": False}
+
+
+# ---------------------------------------------------------------- REST：处置答复
+
+class AnswerIn(BaseModel):
+    body: str = Field(default="", max_length=4000)
+    revision: int = Field(ge=0)  # 乐观并发：须等于服务端当前版本；尚无答复时传 0
+
+
+@app.put("/api/join/{join_code}/cards/{card_id}/answer")
+async def put_answer(join_code: str, card_id: int, body: AnswerIn):
+    """参与者提交/修改本组答复：每张已揭示卡片每组一份，同组多人共享。
+
+    乐观并发：revision 必须等于服务端当前版本（尚无答复时传 0），版本过期
+    返回 409 并在 detail.answer 中携带最新答复，防止同组多窗口静默覆盖；
+    主持人锁定后参与者只读，写入返回 409（detail.error = answers_locked）。
+    """
+    async with state_lock:
+        group, card = resolve_group_card(join_code, card_id)
+        if not card["revealed"]:
+            raise HTTPException(status_code=409, detail="card not revealed yet")
+        if card["answers_locked"]:
+            raise HTTPException(status_code=409, detail={"error": "answers_locked"})
+        existing = db.execute(
+            "SELECT * FROM answers WHERE card_id = ? AND group_id = ?",
+            (card_id, group["id"]),
+        ).fetchone()
+        current = existing["revision"] if existing is not None else 0
+        if body.revision != current:
+            raise HTTPException(status_code=409, detail={
+                "error": "revision_conflict",
+                "answer": answer_public(existing) if existing is not None else None,
+            })
+        now = time.time()
+        if existing is None:
+            db.execute(
+                "INSERT INTO answers (room_id, card_id, group_id, body, revision, updated_at)"
+                " VALUES (?, ?, ?, ?, 1, ?)",
+                (group["room_id"], card_id, group["id"], body.body, now),
+            )
+        else:
+            db.execute(
+                "UPDATE answers SET body = ?, revision = revision + 1, updated_at = ?"
+                " WHERE id = ?",
+                (body.body, now, existing["id"]),
+            )
+        db.commit()
+        fresh = db.execute(
+            "SELECT * FROM answers WHERE card_id = ? AND group_id = ?",
+            (card_id, group["id"]),
+        ).fetchone()
+        room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
+        payload = answer_public(fresh)
+        # 含答复正文：仅主持人与本组参与者可收到（event_visible 按组过滤）
+        await publish(room["code"], room["id"], "answer_updated", payload)
+        return payload
+
+
+async def _set_answers_locked(code: str, card_id: int, locked: bool):
+    """逐卡锁定/重新开放处置答复。幂等：已处于目标状态时直接返回，不发事件。"""
+    async with state_lock:
+        room = get_room_or_404(code)
+        card = db.execute(
+            "SELECT * FROM cards WHERE id = ? AND room_id = ?", (card_id, room["id"])
+        ).fetchone()
+        if card is None:
+            raise HTTPException(status_code=404, detail="card not found")
+        if bool(card["answers_locked"]) != locked:
+            db.execute(
+                "UPDATE cards SET answers_locked = ? WHERE id = ?",
+                (1 if locked else 0, card_id),
+            )
+            db.commit()
+            # 带上卡片的 group_id，广播过滤才能判断该事件属于哪些参与组的视野
+            await publish(room["code"], room["id"], "answer_lock_updated",
+                          {"card_id": card_id, "group_id": card["group_id"],
+                           "answers_locked": locked})
+        return {"card_id": card_id, "answers_locked": locked}
+
+
+@app.post("/api/rooms/{code}/cards/{card_id}/answers/lock")
+async def lock_answers(code: str, card_id: int):
+    """主持人锁定该卡的处置答复：参与者只读，写入返回 409。"""
+    return await _set_answers_locked(code, card_id, True)
+
+
+@app.post("/api/rooms/{code}/cards/{card_id}/answers/unlock")
+async def unlock_answers(code: str, card_id: int):
+    """主持人重新开放该卡的处置答复。"""
+    return await _set_answers_locked(code, card_id, False)
 
 
 # ---------------------------------------------------------------- REST：观察席分享
@@ -932,7 +1063,8 @@ async def reset_room(code: str):
     """归零时钟并收回已揭示卡片；参与组、加入码、卡片目标与门槛编排全部保留。
 
     回执随揭示一并收回：未揭示卡片不可回执，新一轮演练从零开始统计；
-    门槛超时标记同时清零，门槛回到等待状态。
+    门槛超时标记同时清零，门槛回到等待状态；
+    处置答复一并清空并解除全部锁定，新一轮演练从零开始作答。
     """
     async with state_lock:
         room = get_room_or_404(code)
@@ -943,10 +1075,12 @@ async def reset_room(code: str):
             (room["id"],),
         )
         db.execute(
-            "UPDATE cards SET revealed = 0, revealed_at_ms = NULL, timed_out = 0 WHERE room_id = ?",
+            "UPDATE cards SET revealed = 0, revealed_at_ms = NULL, timed_out = 0,"
+            " answers_locked = 0 WHERE room_id = ?",
             (room["id"],),
         )
         db.execute("DELETE FROM receipts WHERE room_id = ?", (room["id"],))
+        db.execute("DELETE FROM answers WHERE room_id = ?", (room["id"],))
         db.commit()
         payload = {"action": "reset", "status": "idle", "elapsed_ms": 0}
         await publish(room["code"], room["id"], "reset", payload)
