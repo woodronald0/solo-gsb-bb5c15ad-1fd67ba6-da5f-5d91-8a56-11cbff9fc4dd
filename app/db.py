@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS cards (
     depends_on_card_id  INTEGER REFERENCES cards(id), -- 回执门槛：前置卡片；NULL = 无门槛
     gate_timeout_seconds INTEGER,                     -- 虚拟时钟超时秒数（自触发时刻起算）；NULL = 不设超时
     timed_out       INTEGER NOT NULL DEFAULT 0,       -- 1 = 因门槛超时而被揭示
+    response_locked INTEGER NOT NULL DEFAULT 0,       -- 1 = 主持人锁定处置答复（参与者只读）
     UNIQUE (room_id, seq)
 );
 
@@ -66,6 +67,17 @@ CREATE TABLE IF NOT EXISTS receipts (
     UNIQUE (card_id, group_id)                        -- 同一参与组对同一卡片仅保留一条回执
 );
 
+CREATE TABLE IF NOT EXISTS responses (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    card_id    INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+    group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    body       TEXT NOT NULL,
+    revision   INTEGER NOT NULL DEFAULT 1,            -- 乐观并发版本：每次成功写入 +1
+    updated_at REAL NOT NULL,
+    UNIQUE (card_id, group_id)                        -- 同一参与组对同一卡片仅保留一份答复
+);
+
 CREATE TABLE IF NOT EXISTS observer_shares (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     room_id          INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -84,6 +96,7 @@ CREATE INDEX IF NOT EXISTS idx_groups_room ON groups(room_id);
 CREATE INDEX IF NOT EXISTS idx_events_room ON events(room_id, id);
 CREATE INDEX IF NOT EXISTS idx_receipts_room ON receipts(room_id, card_id);
 CREATE INDEX IF NOT EXISTS idx_receipts_group ON receipts(group_id);
+CREATE INDEX IF NOT EXISTS idx_responses_room ON responses(room_id, card_id);
 CREATE INDEX IF NOT EXISTS idx_observer_shares_room ON observer_shares(room_id);
 """
 
@@ -93,7 +106,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     - group_id：既有卡片一律视为全员；
     - depends_on_card_id / gate_timeout_seconds / timed_out：回执门槛，
-      既有卡片一律视为无门槛。
+      既有卡片一律视为无门槛；
+    - response_locked：处置答复锁定标记，既有卡片一律视为未锁定。
 
     必须在 executescript(SCHEMA) 之前执行：SCHEMA 里的 idx_cards_group、
     idx_cards_gate 索引依赖这些列，旧库需先补列才能建索引。
@@ -112,6 +126,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE cards ADD COLUMN gate_timeout_seconds INTEGER")
     if "timed_out" not in cols:
         conn.execute("ALTER TABLE cards ADD COLUMN timed_out INTEGER NOT NULL DEFAULT 0")
+    if "response_locked" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN response_locked INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 

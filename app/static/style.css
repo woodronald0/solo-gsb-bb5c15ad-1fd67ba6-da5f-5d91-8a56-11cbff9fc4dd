@@ -255,3 +255,52 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .gate-waiting  { color: var(--amber); }
 .gate-unlocked { color: var(--green); }
 .gate-timeout  { color: var(--red); }
+
+/* 处置答复 */
+.response-lock-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 400;
+  margin-left: 8px;
+}
+.response-lock-btn.locked { color: var(--amber); border-color: var(--amber); }
+
+.response-box {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.response-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.response-label { font-weight: 700; }
+.response-status { margin-left: auto; }
+.badge-locked { background: rgba(245, 185, 66, .15); color: var(--amber); }
+.response-body {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  white-space: pre-wrap;
+  margin-bottom: 8px;
+}
+.response-input { margin-bottom: 8px; }
+.response-submit { padding: 6px 14px; font-size: 13px; }
+
+.response-summary {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  font-size: 12px;
+}
+.response-row { margin-top: 6px; }
+.response-row .response-body { margin: 4px 0 0; }
